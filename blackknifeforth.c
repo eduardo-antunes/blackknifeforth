@@ -29,6 +29,8 @@
 
 #define VERSION "0.1"
 
+typedef int32_t i32;
+
 void *realloc_mem(void *ptr, size_t size) {
     if(size == 0) {
         free(ptr);
@@ -45,13 +47,13 @@ void *realloc_mem(void *ptr, size_t size) {
 // -----------------------------------------------------------------------------
 
 typedef struct {
-    const char *text;
+    char *text;
     int len;
 } string_view;
 
 #define SV_fmt(sv) (sv).len,(sv).text
 
-string_view sv_init(const char *str) {
+string_view sv_init(char *str) {
     return (string_view){ .text = str, strlen(str) };
 }
 
@@ -80,22 +82,29 @@ struct runtime;
 typedef void (*native_fn)(struct runtime *);
 
 typedef union cell {
-    uint32_t num;
+    i32 num;
     struct word *xt;  // execution token for a word
     union cell *addr;
     native_fn native;
 } cell;
 
 cell cell_readnum(string_view sv, bool *ok) {
+    int i = 0;
+    i32 n = 0;
     *ok = true;
-    uint32_t n = 0;
-    for(int i = 0; i < sv.len; ++i) {
+    bool neg = false;
+    if(sv.text[0] == '-') {
+        neg = true;
+        i += 1;
+    }
+    for(; i < sv.len; ++i) {
         if(!isdigit(sv.text[i])) {
             *ok = false;
             break;
         }
         n = n * 10 + (sv.text[i] - '0');
     }
+    n = neg ? -n : n;
     return (cell){ .num = n };
 }
 
@@ -125,7 +134,7 @@ void ds_push(data_stack *ds, cell c) {
     ds_push_with(ds, c, 8);
 }
 
-void ds_push_num(data_stack *ds, uint32_t num) {
+void ds_push_num(data_stack *ds, i32 num) {
     ds_push(ds, (cell){ .num = num });
 }
 
@@ -199,6 +208,7 @@ word *word_find(word *latest, string_view name) {
     word *ptr = latest;
     while(ptr != NULL) {
         if(!check_flag(ptr, FLAG_hidden)
+                && ptr->name.len == name.len
                 && strncasecmp(name.text, ptr->name.text, name.len) == 0)
             return ptr;
         ptr = ptr->prev;
@@ -231,7 +241,6 @@ typedef struct runtime {
 
     // Presentation config
     bool verbose;
-    bool had_output;
 
     // Address of a couple significant words
     word *push_word;
@@ -250,8 +259,6 @@ void runtime_init(runtime *r) {
     r->panic = false;
 
     r->verbose = false;
-    r->had_output = false;
-
     r->push_word = NULL;
     load_prelude(r);
 }
@@ -269,7 +276,6 @@ void runtime_free(runtime *r) {
 }
 
 void load_source(runtime *r, string_view source) {
-    r->had_output = false;
     r->source = source;
     r->line = 1;
     r->start_col = r->col = 1;
@@ -370,8 +376,8 @@ void compile_word(runtime *r, word *w) {
     ds_push_xt(body, w);
 }
 
-void compile_number(runtime *r, cell c) {
-    data_stack *body = &r->current_word->body;
+void compile_number_to(runtime *r, cell c, word *w) {
+    data_stack *body = &w->body;
     ds_push_xt(body, r->push_word);
     ds_push(body, c);
 }
@@ -388,7 +394,7 @@ void next(runtime *r) {
             return;
         }
         if(r->current_word != NULL)
-            compile_number(r, operand);
+            compile_number_to(r, operand, r->current_word);
         else ds_push(&r->ds, operand);
         return;
     }
@@ -398,16 +404,17 @@ void next(runtime *r) {
         else compile_word(r, w);
         return;
     }
-    if(check_flag(w, FLAG_immediate)) {
-        error(r, "immediate word outside of definition");
-        return;
-    }
+    // if(check_flag(w, FLAG_immediate)) {
+    //     error(r, "immediate word outside of definition");
+    //     return;
+    // }
     run_word(r, w);
 }
 
 // -----------------------------------------------------------------------------
 
 void run_source(runtime *r, string_view source) {
+    r->panic = false;
     load_source(r, source);
     while(!scan_end(r)) {
         if(r->panic) break; // critical error
@@ -424,18 +431,42 @@ void repl(runtime *r) {
         if(fgets(buf, 2048, stdin) == NULL) break;
         string_view source = sv_init(buf);
         run_source(r, source);
-        ds_clear(&r->ds);
-        if(!r->had_output)
-            printf("ok\n");
+        if(!r->panic) printf("ok\n");
     }
     printf("\n");
 }
 
+string_view read_file(const char *filename) {
+    string_view source = { .text = NULL, .len = 0 }, err = source;
+    FILE *fp = fopen(filename, "rb");
+    if(fp == NULL) return err;
+    fseek(fp, 0, SEEK_END);
+    source.len = ftell(fp);
+    rewind(fp);
+
+    source.text = realloc_mem(NULL, source.len + 1);
+    int n = fread((char*)source.text, sizeof(char),
+            source.len, fp);
+    if(n < source.len) return err;
+    source.text[n] = '\0'; // terminando com 0 manualmente
+    fclose(fp);
+    return source;
+}
+
+void run_file(runtime *r, const char *filename) {
+    string_view source = read_file(filename);
+    run_source(r, source);
+    sv_free(source);
+}
+
 int main() {
-    runtime knight;
-    runtime_init(&knight);
-    repl(&knight);
-    runtime_free(&knight);
+    runtime bkf;
+    runtime_init(&bkf);
+
+    // run_file(&bkf, "prelude.f");
+    repl(&bkf);
+
+    runtime_free(&bkf);
     return 0;
 }
 
@@ -446,25 +477,12 @@ void register_word(runtime *r, word *w) {
     r->latest = w;
 }
 
-word *register_nat(runtime *r, const char *name, native_fn body, uint8_t flags) {
+word *register_nat(runtime *r, char *name, native_fn body, uint8_t flags) {
     string_view sv = { .text = name, .len = strlen(name) };
     word *w = word_native_new(sv, body);
     w->flags |= flags;
     register_word(r, w);
     return w;
-}
-
-void w_dup(runtime *r) {
-    cell val = safe_pop(r);
-    ds_push(&r->ds, val);
-    ds_push(&r->ds, val);
-}
-
-void w_swap(runtime *r) {
-    cell val2 = safe_pop(r);
-    cell val1 = safe_pop(r);
-    ds_push(&r->ds, val2);
-    ds_push(&r->ds, val1);
 }
 
 void w_define(runtime *r) {
@@ -479,14 +497,83 @@ void w_end(runtime *r) {
     r->current_word = NULL;
 }
 
+void w_constant(runtime *r) {
+    cell n = safe_pop(r);
+    string_view name = scan_word(r);
+    word *w = word_new(name, 0);
+    compile_number_to(r, n, w);
+    register_word(r, w);
+}
+
+void w_immediate(runtime *r) {
+    if(r->current_word == NULL) return;
+    r->current_word->flags |= FLAG_immediate;
+}
+
+void w_quote(runtime *r) {
+    string_view name = scan_word(r);
+    word *w = word_find(r->latest, name);
+    ds_push_xt(&r->ds, w);
+}
+
+void w_compile(runtime *r) {
+    cell n = safe_pop(r);
+    if(r->current_word == NULL) return;
+    ds_push(&r->current_word->body, n);
+}
+
+// -----------------------------------------------------------------------------
+
+void w_dup(runtime *r) {
+    cell n = safe_pop(r);
+    ds_push(&r->ds, n);
+    ds_push(&r->ds, n);
+}
+
+void w_swap(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push(&r->ds, n2);
+    ds_push(&r->ds, n1);
+}
+
+void w_over(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push(&r->ds, n1);
+    ds_push(&r->ds, n2);
+    ds_push(&r->ds, n1);
+}
+
+void w_rot(runtime *r) {
+    cell n3 = safe_pop(r);
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push(&r->ds, n2);
+    ds_push(&r->ds, n3);
+    ds_push(&r->ds, n1);
+}
+
 void w_push(runtime *r) {
     r->ip += 1;
-    cell val = *r->ip;
-    ds_push(&r->ds, val);
+    cell n = *r->ip;
+    ds_push(&r->ds, n);
 }
 
 void w_drop(runtime *r) {
     safe_pop(r);
+}
+
+// -----------------------------------------------------------------------------
+
+void w_print(runtime *r) {
+    cell n = safe_pop(r);
+    printf("%" PRId32 "\n", n.num);
+}
+
+void w_print_u32(runtime *r) {
+    cell n = safe_pop(r);
+    printf("%" PRIX32 "\n", n.num);
 }
 
 void w_dump_ds(runtime *r) {
@@ -496,52 +583,104 @@ void w_dump_ds(runtime *r) {
         else first = false;
         printf("%" PRId32, r->ds.contents[i].num);
     }
-    printf("\n");
-    r->had_output = true;
+    if(!first) printf("\n");
 }
 
-void w_print(runtime *r) {
-    cell val = safe_pop(r);
-    printf("%" PRId32 "\n", val.num);
-    r->had_output = true;
-}
+// -----------------------------------------------------------------------------
 
 void w_add(runtime *r) {
-    cell val2 = safe_pop(r);
-    cell val1 = safe_pop(r);
-    ds_push_num(&r->ds, val1.num + val2.num);
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, n1.num + n2.num);
 }
 
 void w_sub(runtime *r) {
-    cell val2 = safe_pop(r);
-    cell val1 = safe_pop(r);
-    ds_push_num(&r->ds, val1.num - val2.num);
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, n1.num - n2.num);
 }
 
 void w_mul(runtime *r) {
-    cell val2 = safe_pop(r);
-    cell val1 = safe_pop(r);
-    ds_push_num(&r->ds, val1.num * val2.num);
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, n1.num * n2.num);
 }
 
 void w_div(runtime *r) {
-    cell val2 = safe_pop(r);
-    cell val1 = safe_pop(r);
-    ds_push_num(&r->ds, val1.num * val2.num);
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, n1.num * n2.num);
 }
 
+// -----------------------------------------------------------------------------
+
+// In forth, it is traditional to represent true by -1 and false by 0
+// This makes the bitwise operators behave like the standard logic ones
+#define flag(cond) ((cond) ? -1 : 0)
+
+void w_less(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num < n2.num));
+}
+
+void w_less_eq(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num <= n2.num));
+}
+
+void w_greater(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num > n2.num));
+}
+
+void w_greater_eq(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num >= n2.num));
+}
+
+void w_equals(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num == n2.num));
+}
+
+void w_not_eq(runtime *r) {
+    cell n2 = safe_pop(r);
+    cell n1 = safe_pop(r);
+    ds_push_num(&r->ds, flag(n1.num != n2.num));
+}
+
+// -----------------------------------------------------------------------------
+
 void load_prelude(runtime *r) {
-    register_nat(r, "dup"  , w_dup    , 0);
-    register_nat(r, "swap" , w_swap   , 0);
-    register_nat(r, "drop" , w_drop   , 0);
-    register_nat(r, "."    , w_print  , 0);
-    register_nat(r, ".s"   , w_dump_ds, 0);
-    register_nat(r, "+"    , w_add    , 0);
-    register_nat(r, "-"    , w_sub    , 0);
-    register_nat(r, "*"    , w_mul    , 0);
-    register_nat(r, "/"    , w_div    , 0);
-    register_nat(r, ":"    , w_define , 0);
-    register_nat(r, ";"    , w_end    , FLAG_immediate);
+    register_nat(r, ":"        , w_define    , 0);
+    register_nat(r, ";"        , w_end       , FLAG_immediate);
+    register_nat(r, ","        , w_compile   , FLAG_immediate);
+    register_nat(r, "'"        , w_quote     , FLAG_immediate);
+    register_nat(r, "immediate", w_immediate , FLAG_immediate);
+    register_nat(r, "constant" , w_constant  , 0);
+    register_nat(r, "dup"      , w_dup       , 0);
+    register_nat(r, "swap"     , w_swap      , 0);
+    register_nat(r, "drop"     , w_drop      , 0);
+    register_nat(r, "over"     , w_over      , 0);
+    register_nat(r, "rot"      , w_rot       , 0);
+    register_nat(r, "."        , w_print     , 0);
+    register_nat(r, ".u"       , w_print_u32 , 0);
+    register_nat(r, ".s"       , w_dump_ds   , 0);
+    register_nat(r, "+"        , w_add       , 0);
+    register_nat(r, "-"        , w_sub       , 0);
+    register_nat(r, "*"        , w_mul       , 0);
+    register_nat(r, "/"        , w_div       , 0);
+    register_nat(r, "<"        , w_less      , 0);
+    register_nat(r, "<="       , w_less_eq   , 0);
+    register_nat(r, ">"        , w_greater   , 0);
+    register_nat(r, ">="       , w_greater_eq, 0);
+    register_nat(r, "="        , w_equals    , 0);
+    register_nat(r, "<>"       , w_not_eq    , 0);
 
     r->push_word = register_nat(r, "_push", w_push, FLAG_hidden);
 }
