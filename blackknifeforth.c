@@ -18,9 +18,9 @@
 #include <stdbool.h>
 #include <inttypes.h>
 
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 #include <ctype.h>
@@ -30,6 +30,12 @@
 #define VERSION "0.1"
 
 typedef int32_t i32;
+
+#ifdef __GNUC__
+# define UNUSED __attribute__((unused))
+#else
+# define UNUSED
+#endif // __GNUC__
 
 void *realloc_mem(void *ptr, size_t size) {
     if(size == 0) {
@@ -44,28 +50,31 @@ void *realloc_mem(void *ptr, size_t size) {
     return new_ptr;
 }
 
+#define get_mem(size) realloc_mem(NULL, size)
+#define free_mem(ptr) realloc_mem(ptr, 0)
+
 // -----------------------------------------------------------------------------
 
 typedef struct {
     char *text;
     int len;
-} string_view;
+} StringView;
 
 #define SV_fmt(sv) (sv).len,(sv).text
 
-string_view sv_init(char *str) {
-    return (string_view){ .text = str, strlen(str) };
+StringView sv_init(char *str) {
+    return (StringView){ .text = str, strlen(str) };
 }
 
-string_view sv_copy(string_view src) {
-    string_view dest = { .len = src.len };
-    dest.text = realloc_mem(NULL, src.len + 1);
-    memcpy((char*)dest.text, src.text, src.len);
+StringView sv_copy(StringView src) {
+    StringView dest = { .len = src.len };
+    dest.text = get_mem(src.len + 1);
+    memcpy(dest.text, src.text, src.len);
     return dest;
 }
 
-void sv_free(string_view sv) {
-    realloc_mem((void*)sv.text, 0);
+void sv_free(StringView sv) {
+    free_mem(sv.text);
 }
 
 // Case insensitive string comparison is non-portable in C, unless you
@@ -78,20 +87,19 @@ void sv_free(string_view sv) {
 
 // -----------------------------------------------------------------------------
 
-struct runtime;
-typedef void (*native_fn)(struct runtime *);
+struct processor;
+typedef void (*CodeWordFn)(struct processor *);
 
-typedef union cell {
+typedef union value {
     i32 num;
+    char ch;
     struct word *xt;  // execution token for a word
-    union cell *addr;
-    native_fn native;
-} cell;
+    union value *addr; // address of a variable or instruction
+} Value;
 
-cell cell_readnum(string_view sv, bool *ok) {
+Value value_read_num(StringView sv, bool *ok) {
     int i = 0;
     i32 n = 0;
-    *ok = true;
     bool neg = false;
     if(sv.text[0] == '-') {
         neg = true;
@@ -105,69 +113,86 @@ cell cell_readnum(string_view sv, bool *ok) {
         n = n * 10 + (sv.text[i] - '0');
     }
     n = neg ? -n : n;
-    return (cell){ .num = n };
+    return (Value){ .num = n };
+}
+
+Value value_read_ch(StringView sv, bool *ok) {
+    if(sv.len > 3 || sv.text[2] != '\'') {
+        *ok = false;
+        return (Value){ .ch = 0 };
+    }
+    return (Value){ .ch = sv.text[1] };
+}
+
+Value value_read(StringView sv, bool *ok) {
+    *ok = true;
+    if(sv.text[0] == '-' || isdigit(sv.text[0]))
+        return value_read_num(sv, ok);
+    if(sv.text[0] == '\'')
+        return value_read_ch(sv, ok);
+    *ok = false;
+    return (Value){ .num = 0 };
 }
 
 // -----------------------------------------------------------------------------
 
 typedef struct {
-    cell *contents;
+    Value *contents;
     int count, capacity;
-} data_stack;
+} DataStack;
 
-void ds_init(data_stack *ds) {
+void ds_init(DataStack *ds) {
     ds->contents = NULL;
     ds->count = ds->capacity = 0;
 }
 
-void ds_push_with(data_stack *ds, cell c, int initial_cap) {
+void ds_push(DataStack *ds, Value c) {
     if(ds->count + 1 > ds->capacity) {
         ds->capacity = (ds->capacity == 0) ?
-            initial_cap : ds->capacity * 2;
+            8 : ds->capacity * 2;
         ds->contents = realloc_mem(ds->contents,
                 ds->capacity * sizeof(*ds->contents));
     }
     ds->contents[ds->count++] = c;
 }
 
-void ds_push(data_stack *ds, cell c) {
-    ds_push_with(ds, c, 8);
+void ds_push_num(DataStack *ds, i32 num) {
+    Value v = { .num = num };
+    ds_push(ds, v);
 }
 
-void ds_push_num(data_stack *ds, i32 num) {
-    ds_push(ds, (cell){ .num = num });
+void ds_push_xt(DataStack *ds, struct word *word) {
+    Value v = { .xt = word };
+    ds_push(ds, v);
 }
 
-void ds_push_xt(data_stack *ds, struct word *xt) {
-    ds_push(ds, (cell){ .xt = xt });
-}
-
-void ds_push_addr(data_stack *ds, cell *addr) {
+void ds_push_addr(DataStack *ds, Value *addr) {
     if(addr == NULL) return;
-    ds_push(ds, (cell){ .addr = addr });
+    Value v = { .addr = addr };
+    ds_push(ds, v);
 }
 
-int ds_pop(data_stack *ds, cell *out) {
+int ds_pop(DataStack *ds, Value *out) {
     if(ds->count == 0) return -1; // underflow
     *out = ds->contents[--ds->count];
     return 0;
 }
 
-int ds_pop_addr(data_stack *ds, cell **ptr) {
-    *ptr = (ds->count == 0) ? NULL : ds->contents[--ds->count].addr;
-    return 0;
+Value *ds_pop_addr(DataStack *ds) {
+    if(ds->count == 0) return NULL;
+    return ds->contents[--ds->count].addr;
 }
 
-void ds_clear(data_stack *ds) {
-    ds->count = 0;
-}
-
-cell *ds_top(const data_stack *ds) {
+Value *ds_top(const DataStack *ds) {
     if(ds->count == 0) return NULL;
     return &ds->contents[ds->count - 1];
 }
 
-void ds_free(data_stack *ds) {
+void ds_clear(DataStack *ds) {
+    ds->count = 0;
+}
+
+void ds_free(DataStack *ds) {
     realloc_mem(ds->contents, 0);
     ds_init(ds);
 }
@@ -175,269 +200,298 @@ void ds_free(data_stack *ds) {
 // -----------------------------------------------------------------------------
 
 typedef enum : uint8_t {
-    FLAG_native    = (1 << 0),
-    FLAG_immediate = (1 << 1),
-    FLAG_hidden    = (1 << 2),
-} word_flag;
+    FLAG_code      = (1 << 0), // code or colon word?
+    FLAG_immediate = (1 << 1), // executed on compile time?
+    FLAG_hidden    = (1 << 2), // hidden to the user?
+    FLAG_comp_only = (1 << 3), // only valid in definitions?
+} WordFlag;
 
-#define check_flag(w, f) ((w)->flags & (f))
+#define check_flag(flags, f) ((flags) & (f))
 
 typedef struct word {
     struct word *prev;
-    string_view name; // dynamically allocated
-    data_stack body;
+    StringView name;
     uint8_t flags;
-} word;
 
-word *word_new(string_view name, uint8_t flags) {
-    word *w = realloc_mem(NULL, sizeof(*w));
+    union {
+        CodeWordFn code; // valid if flags & FLAG_code
+        DataStack colon; // valid otherwise
+    } as;
+} Word;
+
+Word *word_new(StringView name, uint8_t flags) {
+    Word *w = get_mem(sizeof(*w));
     w->prev = NULL;
-    w->name = sv_copy(name);
-    ds_init(&w->body);
     w->flags = flags;
+    w->name = sv_copy(name);
+    if(!check_flag(flags, FLAG_code))
+        ds_init(&w->as.colon);
     return w;
 }
 
-word *word_native_new(string_view name, native_fn body) {
-    word *w = word_new(name, FLAG_native);
-    ds_push_with(&w->body, (cell){ .native = body }, 1);
+Word *word_code_new(StringView name, CodeWordFn body) {
+    Word *w = word_new(name, FLAG_code);
+    w->as.code = body;
     return w;
 }
 
-word *word_find(word *latest, string_view name) {
-    word *ptr = latest;
-    while(ptr != NULL) {
-        if(!check_flag(ptr, FLAG_hidden)
-                && ptr->name.len == name.len
-                && strncasecmp(name.text, ptr->name.text, name.len) == 0)
-            return ptr;
-        ptr = ptr->prev;
+void word_add(Word *w, Value val) {
+    if(check_flag(w->flags, FLAG_code)) return;
+    ds_push(&w->as.colon, val);
+}
+
+void word_add_xt(Word *w, Word *xt) {
+    Value v = { .xt = xt };
+    word_add(w, v);
+}
+
+void word_free(Word *w) {
+    sv_free(w->name);
+    if(!check_flag(w->flags, FLAG_code))
+        ds_free(&w->as.colon);
+    free_mem(w);
+}
+
+void word_list_add(Word **last, Word *w) {
+    w->prev = *last;
+    *last = w;
+}
+
+Word *word_list_find(Word *last, StringView name) {
+    Word *w = last;
+    while(w != NULL) {
+        if(!check_flag(w->flags, FLAG_hidden)
+                && w->name.len == name.len
+                && strncasecmp(name.text, w->name.text, name.len) == 0)
+            return w;
+        w = w->prev;
     }
     return NULL;
 }
 
-void word_free(word *word) {
-    sv_free(word->name);
-    ds_free(&word->body);
-    word->prev = NULL;
+void word_list_free(Word *last) {
+    Word *w = last, *aux;
+    while(w != NULL) {
+        aux = w->prev;
+        word_free(w);
+        w = aux;
+    }
 }
 
 // -----------------------------------------------------------------------------
 
-typedef struct runtime {
-    // Text processing fields, used for scanning
-    string_view source;
+typedef struct {
+    StringView source;
     int offset;
     int line;
     int start_col, col;
+} Scanner;
 
-    // Runtime related fields, for actually executing
-    word *latest;
-    cell *ip;
-    word *current_word;
-    data_stack ds;
-    data_stack rets;
-    bool panic;
-
-    // Presentation config
-    bool verbose;
-
-    // Address of a couple significant words
-    word *push_word;
-} runtime;
-
-// Loads predefined words of the language
-void load_prelude(runtime *r);
-
-void runtime_init(runtime *r) {
-    r->source.len = 0;
-    r->latest = NULL;
-    r->ip = NULL;
-    ds_init(&r->ds);
-    ds_init(&r->rets);
-    r->current_word = NULL;
-    r->panic = false;
-
-    r->verbose = false;
-    r->push_word = NULL;
-    load_prelude(r);
+void scan_init(Scanner *s, StringView source) {
+    s->source = source;
+    s->offset = 0;
+    s->line = 1;
+    s->start_col = s->col = 1;
 }
 
-void runtime_free(runtime *r) {
-    ds_free(&r->ds);
-    ds_free(&r->rets);
-    word *ptr = r->latest, *aux;
-    while(ptr != NULL) {
-        aux = ptr->prev;
-        word_free(ptr);
-        ptr = aux;
+char scan_peek(const Scanner *s) {
+    return s->source.text[s->offset];
+}
+
+StringView scan_peek_text(const Scanner *s) {
+    return (StringView){ .text = s->source.text, .len = s->offset };
+}
+
+bool scan_end(const Scanner *s) {
+    return s->offset >= s->source.len;
+}
+
+void scan_advance(Scanner *s) {
+    if(scan_end(s)) return;
+    s->offset += 1;
+    s->col += 1;
+}
+
+void scan_sync(Scanner *s) {
+    while(isspace(scan_peek(s)) && !scan_end(s)) {
+        if(scan_peek(s) == '\n') {
+            s->line += 1;
+            s->col = 0;
+        }
+        scan_advance(s);
     }
-    runtime_init(r);
+    s->source.text = &s->source.text[s->offset];
+    s->source.len -= s->offset;
+    s->offset = 0;
+    s->start_col = s->col;
 }
 
-void load_source(runtime *r, string_view source) {
-    r->source = source;
-    r->line = 1;
-    r->start_col = r->col = 1;
-    r->offset = 0;
+StringView scan_word(Scanner *s) {
+    scan_sync(s);
+    while(!isspace(scan_peek(s)) && !scan_end(s))
+        scan_advance(s);
+    return scan_peek_text(s);
 }
 
 // -----------------------------------------------------------------------------
 
-void error(runtime *r, const char *err_msg) {
-    if(r->verbose)
-        fprintf(stderr, "(%d:%d) error: %s\n", r->line, r->start_col, err_msg);
+typedef struct processor {
+    Scanner scan;
+    Value *ip;    // instruction pointer
+    DataStack ds; // parameter stack, for general use data
+    DataStack rs; // R stack, for auxiliary data
+    bool panic;   // critical error?
+    bool verbose; // verbose error messages?
+
+    Word *dict;      // word list
+    Word *comp_word; // word currently being compiled
+
+    // Address of a couple significant words
+    Word *w_push;
+} Processor;
+
+void load_builtin(Processor *p);
+
+void proc_init(Processor *p) {
+    p->ip = NULL;
+    ds_init(&p->ds);
+    ds_init(&p->rs);
+    p->panic = false;
+    p->verbose = false;
+
+    p->dict = NULL;
+    p->comp_word = NULL;
+    load_builtin(p);
+}
+
+bool proc_compile_mode(const Processor *p) {
+    return p->comp_word != NULL;
+}
+
+void proc_free(Processor *p) {
+    ds_free(&p->ds);
+    ds_free(&p->rs);
+    word_list_free(p->dict);
+    proc_init(p);
+}
+
+void load_source(Processor *p, StringView source) {
+    scan_init(&p->scan, source);
+}
+
+void error(Processor *p, const char *err_msg) {
+    if(p->verbose)
+        fprintf(stderr, "(%d:%d) error: %s\n",
+                p->scan.line, p->scan.start_col, err_msg);
     else fprintf(stderr, "%s\n", err_msg);
-    r->panic = true;
+    p->panic = true;
 }
 
-void error_undef(runtime *r, string_view word) {
-    if(r->verbose)
+void error_undef(Processor *p, StringView word) {
+    if(p->verbose)
         fprintf(stderr, "(%d:%d) error: undefined word '%.*s'\n",
-                r->line, r->start_col, SV_fmt(word));
+                p->scan.line, p->scan.start_col, SV_fmt(word));
     else fprintf(stderr, "%.*s?\n", SV_fmt(word));
-    r->panic = true;
+    p->panic = true;
 }
 
-cell safe_pop(runtime *r) {
-    cell c = { .num = 0 };
-    int err = ds_pop(&r->ds, &c);
-    if(err) error(r, "stack underflow");
+void error_comp_only(Processor *p, StringView word) {
+    if(p->verbose)
+        fprintf(stderr, "(%d:%d) error: word '%.*s' is only valid in definitions\n",
+                p->scan.line, p->scan.start_col, SV_fmt(word));
+    else fprintf(stderr, "%.*s?\n", SV_fmt(word));
+    p->panic = true;
+}
+
+Value proc_pop(Processor *p) {
+    Value c = { .num = 0 };
+    int err = ds_pop(&p->ds, &c);
+    if(!p->panic && err) error(p, "stack underflow");
     return c;
 }
 
 // -----------------------------------------------------------------------------
 
-char scan_peek(const runtime *r) {
-    return r->source.text[r->offset];
-}
-
-string_view scan_peek_text(const runtime *r) {
-    return (string_view){ .text = r->source.text, .len = r->offset };
-}
-
-bool scan_end(const runtime *r) {
-    return r->offset >= r->source.len;
-}
-
-void scan_advance(runtime *r) {
-    if(scan_end(r)) return;
-    r->offset += 1;
-    r->col += 1;
-}
-
-void scan_sync(runtime *r) {
-    while(isspace(scan_peek(r)) && !scan_end(r)) {
-        if(scan_peek(r) == '\n') {
-            r->line += 1;
-            r->col = 0;
-        }
-        scan_advance(r);
-    }
-    r->source.text = &r->source.text[r->offset];
-    r->source.len -= r->offset;
-    r->offset = 0;
-    r->start_col = r->col;
-}
-
-string_view scan_word(runtime *r) {
-    scan_sync(r);
-    while(!isspace(scan_peek(r)) && !scan_end(r))
-        scan_advance(r);
-    return scan_peek_text(r);
-}
-
-// -----------------------------------------------------------------------------
-
-void run_word(runtime *r, word *w) {
-    if(check_flag(w, FLAG_native)) {
-        w->body.contents[0].native(r);
+void execute_word(Processor *p, Word *w) {
+    if(check_flag(w->flags, FLAG_code)) {
+        w->as.code(p);
         return;
     }
-    if(w->body.count == 0) return;
-    data_stack *body = &w->body;
+    DataStack *word_body = &w->as.colon;
+    if(word_body->count == 0) return; // empty word
 
-    // Save return address to the return stack
-    ds_push_addr(&r->rets, r->ip);
-    r->ip = body->contents;
-    while(r->ip >= body->contents
-            && r->ip < body->contents + body->count) {
-        if(r->panic) break; // critical error
-        cell operation = *r->ip;
-        run_word(r, operation.xt);
-        r->ip += 1;
+    Value *old_ip = p->ip;
+    p->ip = word_body->contents;
+    while(p->ip >= word_body->contents
+            && p->ip < word_body->contents + word_body->count) {
+        Word *operation = p->ip->xt;
+        execute_word(p, operation);
+        p->ip += 1;
     }
-    // Restore return address
-    ds_pop_addr(&r->rets, &r->ip);
+    p->ip = old_ip;
+    ds_clear(&p->rs);
 }
 
-void compile_word(runtime *r, word *w) {
-    data_stack *body = &r->current_word->body;
-    ds_push_xt(body, w);
+void word_add_push(Processor *p, Word *w, Value operand) {
+    if(!proc_compile_mode(p)) return;
+    word_add_xt(w, p->w_push);
+    word_add(w, operand);
 }
 
-void compile_number_to(runtime *r, cell c, word *w) {
-    data_stack *body = &w->body;
-    ds_push_xt(body, r->push_word);
-    ds_push(body, c);
-}
-
-void next(runtime *r) {
-    bool is_num = false;
-    string_view name = scan_word(r);
+void proc_next(Processor *p) {
+    bool is_val = false;
+    StringView name = scan_word(&p->scan);
     if(name.len == 0) return;
-    word *w = word_find(r->latest, name);
+    Word *w = word_list_find(p->dict, name);
     if(w == NULL) {
-        cell operand = cell_readnum(name, &is_num);
-        if(!is_num) {
-            error_undef(r, name);
+        Value operand = value_read(name, &is_val);
+        if(!is_val) {
+            error_undef(p, name);
             return;
         }
-        if(r->current_word != NULL)
-            compile_number_to(r, operand, r->current_word);
-        else ds_push(&r->ds, operand);
+        if(proc_compile_mode(p))
+            word_add_push(p, p->comp_word, operand);
+        else ds_push(&p->ds, operand);
         return;
     }
-    if(r->current_word != NULL) {
-        if(check_flag(w, FLAG_immediate))
-            run_word(r, w);
-        else compile_word(r, w);
+    if(proc_compile_mode(p)) {
+        if(check_flag(w->flags, FLAG_immediate))
+            execute_word(p, w);
+        else word_add_xt(p->comp_word, w);
         return;
     }
-    // if(check_flag(w, FLAG_immediate)) {
-    //     error(r, "immediate word outside of definition");
-    //     return;
-    // }
-    run_word(r, w);
+    if(check_flag(w->flags, FLAG_comp_only))
+        error_comp_only(p, name);
+    else execute_word(p, w);
 }
 
 // -----------------------------------------------------------------------------
 
-void run_source(runtime *r, string_view source) {
-    r->panic = false;
-    load_source(r, source);
-    while(!scan_end(r)) {
-        if(r->panic) break; // critical error
-        next(r);
+void run_source(Processor *p, StringView source) {
+    p->panic = false;
+    load_source(p, source);
+    while(!scan_end(&p->scan)) {
+        if(p->panic) break; // critical error
+        proc_next(p);
     }
 }
 
-void repl(runtime *r) {
+void repl(Processor *p) {
     printf("blackknifeforth " VERSION
             "  Copyright (C) 2025 Eduardo Antunes\n");
     char buf[2048];
     while(true) {
         printf("> ");
         if(fgets(buf, 2048, stdin) == NULL) break;
-        string_view source = sv_init(buf);
-        run_source(r, source);
-        if(!r->panic) printf("ok\n");
+        StringView source = sv_init(buf);
+        run_source(p, source);
+        if(!p->panic) printf("ok\n");
     }
     printf("\n");
 }
 
-string_view read_file(const char *filename) {
-    string_view source = { .text = NULL, .len = 0 }, err = source;
+StringView read_file(const char *filename) {
+    StringView source = { .text = NULL, .len = 0 }, err = source;
     FILE *fp = fopen(filename, "rb");
     if(fp == NULL) return err;
     fseek(fp, 0, SEEK_END);
@@ -453,163 +507,168 @@ string_view read_file(const char *filename) {
     return source;
 }
 
-void run_file(runtime *r, const char *filename) {
-    string_view source = read_file(filename);
-    run_source(r, source);
+void run_file(Processor *p, const char *filename) {
+    bool v = p->verbose;
+    p->verbose = true;
+    StringView source = read_file(filename);
+    run_source(p, source);
     sv_free(source);
+    p->verbose = v;
 }
 
 int main() {
-    runtime bkf;
-    runtime_init(&bkf);
+    Processor bkf;
+    proc_init(&bkf);
 
     // run_file(&bkf, "prelude.f");
     repl(&bkf);
 
-    runtime_free(&bkf);
+    proc_free(&bkf);
     return 0;
 }
 
 // -----------------------------------------------------------------------------
 
-void register_word(runtime *r, word *w) {
-    w->prev = r->latest;
-    r->latest = w;
-}
-
-word *register_nat(runtime *r, char *name, native_fn body, uint8_t flags) {
-    string_view sv = { .text = name, .len = strlen(name) };
-    word *w = word_native_new(sv, body);
+Word *code_word(Processor *p, char *name, CodeWordFn body, uint8_t flags) {
+    StringView sv = { .text = name, .len = strlen(name) };
+    Word *w = word_code_new(sv, body);
     w->flags |= flags;
-    register_word(r, w);
+    word_list_add(&p->dict, w);
     return w;
 }
 
-void w_define(runtime *r) {
-    string_view name = scan_word(r);
-    word *w = word_new(name, FLAG_hidden);
-    r->current_word = w;
-    register_word(r, w);
+void w_define(Processor *p) {
+    StringView name = scan_word(&p->scan);
+    Word *w = word_new(name, FLAG_hidden);
+    p->comp_word = w;
+    word_list_add(&p->dict, w);
 }
 
-void w_end(runtime *r) {
-    r->current_word->flags &= ~FLAG_hidden;
-    r->current_word = NULL;
+void w_end(Processor *p) {
+    p->comp_word->flags &= ~FLAG_hidden;
+    p->comp_word = NULL;
 }
 
-void w_constant(runtime *r) {
-    cell n = safe_pop(r);
-    string_view name = scan_word(r);
-    word *w = word_new(name, 0);
-    compile_number_to(r, n, w);
-    register_word(r, w);
+void w_constant(Processor *p) {
+    Value val = proc_pop(p);
+    StringView name = scan_word(&p->scan);
+    Word *w = word_new(name, 0);
+    word_add_push(p, w, val);
+    word_list_add(&p->dict, w);
 }
 
-void w_immediate(runtime *r) {
-    if(r->current_word == NULL) return;
-    r->current_word->flags |= FLAG_immediate;
+void w_immediate(Processor *p) {
+    p->comp_word->flags |= FLAG_immediate;
 }
 
-void w_quote(runtime *r) {
-    string_view name = scan_word(r);
-    word *w = word_find(r->latest, name);
-    ds_push_xt(&r->ds, w);
+void w_quote(Processor *p) {
+    StringView name = scan_word(&p->scan);
+    Word *w = word_list_find(p->dict, name);
+    ds_push_xt(&p->ds, w);
 }
 
-void w_compile(runtime *r) {
-    cell n = safe_pop(r);
-    if(r->current_word == NULL) return;
-    ds_push(&r->current_word->body, n);
-}
-
-// -----------------------------------------------------------------------------
-
-void w_dup(runtime *r) {
-    cell n = safe_pop(r);
-    ds_push(&r->ds, n);
-    ds_push(&r->ds, n);
-}
-
-void w_swap(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push(&r->ds, n2);
-    ds_push(&r->ds, n1);
-}
-
-void w_over(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push(&r->ds, n1);
-    ds_push(&r->ds, n2);
-    ds_push(&r->ds, n1);
-}
-
-void w_rot(runtime *r) {
-    cell n3 = safe_pop(r);
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push(&r->ds, n2);
-    ds_push(&r->ds, n3);
-    ds_push(&r->ds, n1);
-}
-
-void w_push(runtime *r) {
-    r->ip += 1;
-    cell n = *r->ip;
-    ds_push(&r->ds, n);
-}
-
-void w_drop(runtime *r) {
-    safe_pop(r);
+void w_compile(Processor *p) {
+    Value value = proc_pop(p);
+    ds_push(&p->comp_word->as.colon, value);
 }
 
 // -----------------------------------------------------------------------------
 
-void w_print(runtime *r) {
-    cell n = safe_pop(r);
-    printf("%" PRId32 "\n", n.num);
+void w_dup(Processor *p) {
+    Value n = proc_pop(p);
+    ds_push(&p->ds, n);
+    ds_push(&p->ds, n);
 }
 
-void w_print_u32(runtime *r) {
-    cell n = safe_pop(r);
-    printf("%" PRIX32 "\n", n.num);
+void w_swap(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push(&p->ds, n2);
+    ds_push(&p->ds, n1);
 }
 
-void w_dump_ds(runtime *r) {
+void w_over(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push(&p->ds, n1);
+    ds_push(&p->ds, n2);
+    ds_push(&p->ds, n1);
+}
+
+void w_rot(Processor *p) {
+    Value n3 = proc_pop(p);
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push(&p->ds, n2);
+    ds_push(&p->ds, n3);
+    ds_push(&p->ds, n1);
+}
+
+void w_push(Processor *p) {
+    p->ip += 1;
+    Value n = *p->ip;
+    ds_push(&p->ds, n);
+}
+
+void w_drop(Processor *p) {
+    proc_pop(p);
+}
+
+// -----------------------------------------------------------------------------
+
+void w_print(Processor *p) {
+    Value val = proc_pop(p);
+    printf("%" PRId32, val.num);
+}
+
+void w_print_u32(Processor *p) {
+    Value val = proc_pop(p);
+    printf("%" PRIX32, val.num);
+}
+
+void w_print_ch(Processor *p) {
+    Value val = proc_pop(p);
+    printf("%c", val.ch);
+}
+
+void w_endline(UNUSED Processor *p) {
+    printf("\n");
+}
+
+void w_dump_ds(Processor *p) {
     bool first = true;
-    for(int i = 0; i < r->ds.count; ++i) {
+    for(int i = 0; i < p->ds.count; ++i) {
         if(!first) printf(" ");
         else first = false;
-        printf("%" PRId32, r->ds.contents[i].num);
+        printf("%" PRId32, p->ds.contents[i].num);
     }
     if(!first) printf("\n");
 }
 
 // -----------------------------------------------------------------------------
 
-void w_add(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, n1.num + n2.num);
+void w_add(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, n1.num + n2.num);
 }
 
-void w_sub(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, n1.num - n2.num);
+void w_sub(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, n1.num - n2.num);
 }
 
-void w_mul(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, n1.num * n2.num);
+void w_mul(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, n1.num * n2.num);
 }
 
-void w_div(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, n1.num * n2.num);
+void w_div(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, n1.num * n2.num);
 }
 
 // -----------------------------------------------------------------------------
@@ -618,69 +677,92 @@ void w_div(runtime *r) {
 // This makes the bitwise operators behave like the standard logic ones
 #define flag(cond) ((cond) ? -1 : 0)
 
-void w_less(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num < n2.num));
+void w_less(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num < n2.num));
 }
 
-void w_less_eq(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num <= n2.num));
+void w_less_eq(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num <= n2.num));
 }
 
-void w_greater(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num > n2.num));
+void w_greater(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num > n2.num));
 }
 
-void w_greater_eq(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num >= n2.num));
+void w_greater_eq(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num >= n2.num));
 }
 
-void w_equals(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num == n2.num));
+void w_equals(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num == n2.num));
 }
 
-void w_not_eq(runtime *r) {
-    cell n2 = safe_pop(r);
-    cell n1 = safe_pop(r);
-    ds_push_num(&r->ds, flag(n1.num != n2.num));
+void w_not_eq(Processor *p) {
+    Value n2 = proc_pop(p);
+    Value n1 = proc_pop(p);
+    ds_push_num(&p->ds, flag(n1.num != n2.num));
+}
+
+void w_and(Processor *p) {
+    Value f2 = proc_pop(p);
+    Value f1 = proc_pop(p);
+    ds_push_num(&p->ds, f1.num & f2.num);
+}
+
+void w_or(Processor *p) {
+    Value f2 = proc_pop(p);
+    Value f1 = proc_pop(p);
+    ds_push_num(&p->ds, f1.num | f2.num);
+}
+
+void w_xor(Processor *p) {
+    Value f2 = proc_pop(p);
+    Value f1 = proc_pop(p);
+    ds_push_num(&p->ds, f1.num ^ f2.num);
 }
 
 // -----------------------------------------------------------------------------
 
-void load_prelude(runtime *r) {
-    register_nat(r, ":"        , w_define    , 0);
-    register_nat(r, ";"        , w_end       , FLAG_immediate);
-    register_nat(r, ","        , w_compile   , FLAG_immediate);
-    register_nat(r, "'"        , w_quote     , FLAG_immediate);
-    register_nat(r, "immediate", w_immediate , FLAG_immediate);
-    register_nat(r, "constant" , w_constant  , 0);
-    register_nat(r, "dup"      , w_dup       , 0);
-    register_nat(r, "swap"     , w_swap      , 0);
-    register_nat(r, "drop"     , w_drop      , 0);
-    register_nat(r, "over"     , w_over      , 0);
-    register_nat(r, "rot"      , w_rot       , 0);
-    register_nat(r, "."        , w_print     , 0);
-    register_nat(r, ".u"       , w_print_u32 , 0);
-    register_nat(r, ".s"       , w_dump_ds   , 0);
-    register_nat(r, "+"        , w_add       , 0);
-    register_nat(r, "-"        , w_sub       , 0);
-    register_nat(r, "*"        , w_mul       , 0);
-    register_nat(r, "/"        , w_div       , 0);
-    register_nat(r, "<"        , w_less      , 0);
-    register_nat(r, "<="       , w_less_eq   , 0);
-    register_nat(r, ">"        , w_greater   , 0);
-    register_nat(r, ">="       , w_greater_eq, 0);
-    register_nat(r, "="        , w_equals    , 0);
-    register_nat(r, "<>"       , w_not_eq    , 0);
+void load_builtin(Processor *p) {
+    code_word(p, ":"        , w_define    , 0);
+    code_word(p, "'"        , w_quote     , FLAG_immediate);
+    code_word(p, ";"        , w_end       , FLAG_immediate | FLAG_comp_only);
+    code_word(p, ","        , w_compile   , FLAG_immediate | FLAG_comp_only);
+    code_word(p, "immediate", w_immediate , FLAG_immediate | FLAG_comp_only);
+    code_word(p, "constant" , w_constant  , FLAG_immediate);
+    code_word(p, "dup"      , w_dup       , 0);
+    code_word(p, "swap"     , w_swap      , 0);
+    code_word(p, "drop"     , w_drop      , 0);
+    code_word(p, "over"     , w_over      , 0);
+    code_word(p, "rot"      , w_rot       , 0);
+    code_word(p, "."        , w_print     , 0);
+    code_word(p, ".u"       , w_print_u32 , 0);
+    code_word(p, ".c"       , w_print_ch  , 0);
+    code_word(p, "cr"       , w_endline   , 0);
+    code_word(p, ".s"       , w_dump_ds   , 0);
+    code_word(p, "+"        , w_add       , 0);
+    code_word(p, "-"        , w_sub       , 0);
+    code_word(p, "*"        , w_mul       , 0);
+    code_word(p, "/"        , w_div       , 0);
+    code_word(p, "<"        , w_less      , 0);
+    code_word(p, "<="       , w_less_eq   , 0);
+    code_word(p, ">"        , w_greater   , 0);
+    code_word(p, ">="       , w_greater_eq, 0);
+    code_word(p, "="        , w_equals    , 0);
+    code_word(p, "<>"       , w_not_eq    , 0);
+    code_word(p, "and"      , w_and       , 0);
+    code_word(p, "or"       , w_or        , 0);
+    code_word(p, "xor"      , w_xor       , 0);
 
-    r->push_word = register_nat(r, "_push", w_push, FLAG_hidden);
+    p->w_push = code_word(p, "_push", w_push, FLAG_hidden);
 }
