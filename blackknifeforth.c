@@ -235,16 +235,6 @@ Word *word_code_new(StringView name, CodeWordFn body) {
     return w;
 }
 
-void word_add(Word *w, Value val) {
-    if(check_flag(w->flags, FLAG_code)) return;
-    ds_push(&w->as.colon, val);
-}
-
-void word_add_xt(Word *w, Word *xt) {
-    Value v = { .xt = xt };
-    word_add(w, v);
-}
-
 void word_free(Word *w) {
     sv_free(w->name);
     if(!check_flag(w->flags, FLAG_code))
@@ -347,6 +337,7 @@ typedef struct processor {
     Word *comp_word; // word currently being compiled
 
     // Address of a couple significant words
+    Word *w_exit;
     Word *w_push;
 } Processor;
 
@@ -426,16 +417,16 @@ void execute_word(Processor *p, Word *w) {
             && p->ip < word_body->contents + word_body->count) {
         Word *operation = p->ip->xt;
         execute_word(p, operation);
+        if(p->ip == NULL) break;
         p->ip += 1;
     }
     p->ip = old_ip;
     ds_clear(&p->rs);
 }
 
-void word_add_push(Processor *p, Word *w, Value operand) {
-    if(!proc_compile_mode(p)) return;
-    word_add_xt(w, p->w_push);
-    word_add(w, operand);
+void proc_comp_push(Processor *p, Word *w, Value val) {
+    ds_push_xt(&w->as.colon, p->w_push);
+    ds_push(&w->as.colon, val);
 }
 
 void proc_next(Processor *p) {
@@ -450,14 +441,14 @@ void proc_next(Processor *p) {
             return;
         }
         if(proc_compile_mode(p))
-            word_add_push(p, p->comp_word, operand);
+            proc_comp_push(p, p->comp_word, operand);
         else ds_push(&p->ds, operand);
         return;
     }
     if(proc_compile_mode(p)) {
         if(check_flag(w->flags, FLAG_immediate))
             execute_word(p, w);
-        else word_add_xt(p->comp_word, w);
+        else ds_push_xt(&p->comp_word->as.colon, w);
         return;
     }
     if(check_flag(w->flags, FLAG_comp_only))
@@ -485,7 +476,7 @@ void repl(Processor *p) {
         if(fgets(buf, 2048, stdin) == NULL) break;
         StringView source = sv_init(buf);
         run_source(p, source);
-        if(!p->panic) printf("ok\n");
+        if(!p->panic) printf(" ok\n");
     }
     printf("\n");
 }
@@ -520,7 +511,7 @@ int main() {
     Processor bkf;
     proc_init(&bkf);
 
-    // run_file(&bkf, "prelude.f");
+    run_file(&bkf, "prelude.f");
     repl(&bkf);
 
     proc_free(&bkf);
@@ -549,14 +540,6 @@ void w_end(Processor *p) {
     p->comp_word = NULL;
 }
 
-void w_constant(Processor *p) {
-    Value val = proc_pop(p);
-    StringView name = scan_word(&p->scan);
-    Word *w = word_new(name, 0);
-    word_add_push(p, w, val);
-    word_list_add(&p->dict, w);
-}
-
 void w_immediate(Processor *p) {
     p->comp_word->flags |= FLAG_immediate;
 }
@@ -570,6 +553,48 @@ void w_quote(Processor *p) {
 void w_compile(Processor *p) {
     Value value = proc_pop(p);
     ds_push(&p->comp_word->as.colon, value);
+}
+
+void w_exit(Processor *p) {
+    p->ip = NULL;
+}
+
+// -----------------------------------------------------------------------------
+
+void w_constant(Processor *p) {
+    Value val = proc_pop(p);
+    StringView name = scan_word(&p->scan);
+    Word *w = word_new(name, 0);
+    proc_comp_push(p, w, val);
+    word_list_add(&p->dict, w);
+}
+
+void w_variable(Processor *p) {
+    Value tmp = { .num = 0 };
+    StringView name = scan_word(&p->scan);
+    Word *w = word_new(name, 0);
+
+    proc_comp_push(p, w, tmp);
+    Value *operand = ds_top(&w->as.colon);
+    ds_push_xt(&w->as.colon, p->w_exit);
+    ds_push(&w->as.colon, tmp);
+    operand->addr = ds_top(&w->as.colon);
+
+    word_list_add(&p->dict, w);
+}
+
+void w_fetch(Processor *p) {
+    Value addr = proc_pop(p);
+    if(p->panic) return;
+    Value val = *addr.addr;
+    ds_push(&p->ds, val);
+}
+
+void w_store(Processor *p) {
+    Value addr = proc_pop(p);
+    if(p->panic) return;
+    Value val = proc_pop(p);
+    *addr.addr = val;
 }
 
 // -----------------------------------------------------------------------------
@@ -618,16 +643,19 @@ void w_drop(Processor *p) {
 
 void w_print(Processor *p) {
     Value val = proc_pop(p);
+    if(p->panic) return;
     printf("%" PRId32, val.num);
 }
 
 void w_print_u32(Processor *p) {
     Value val = proc_pop(p);
+    if(p->panic) return;
     printf("%" PRIX32, val.num);
 }
 
 void w_print_ch(Processor *p) {
     Value val = proc_pop(p);
+    if(p->panic) return;
     printf("%c", val.ch);
 }
 
@@ -734,12 +762,18 @@ void w_xor(Processor *p) {
 // -----------------------------------------------------------------------------
 
 void load_builtin(Processor *p) {
+    p->w_exit = code_word(p, "exit" , w_exit, 0);
+    p->w_push = code_word(p, "_push", w_push, FLAG_hidden);
+
     code_word(p, ":"        , w_define    , 0);
     code_word(p, "'"        , w_quote     , FLAG_immediate);
     code_word(p, ";"        , w_end       , FLAG_immediate | FLAG_comp_only);
     code_word(p, ","        , w_compile   , FLAG_immediate | FLAG_comp_only);
     code_word(p, "immediate", w_immediate , FLAG_immediate | FLAG_comp_only);
     code_word(p, "constant" , w_constant  , FLAG_immediate);
+    code_word(p, "variable" , w_variable  , 0);
+    code_word(p, "@"        , w_fetch     , 0);
+    code_word(p, "!"        , w_store     , 0);
     code_word(p, "dup"      , w_dup       , 0);
     code_word(p, "swap"     , w_swap      , 0);
     code_word(p, "drop"     , w_drop      , 0);
@@ -763,6 +797,4 @@ void load_builtin(Processor *p) {
     code_word(p, "and"      , w_and       , 0);
     code_word(p, "or"       , w_or        , 0);
     code_word(p, "xor"      , w_xor       , 0);
-
-    p->w_push = code_word(p, "_push", w_push, FLAG_hidden);
 }
